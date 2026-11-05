@@ -910,7 +910,8 @@ export async function getSobjectsList(sfHost) {
   // Check cache first (only if caching is enabled)
   if (cacheEnabled) {
     const cached = await DataCache.getCachedData(Constants.CACHE_SOBJECTS_LIST, sfHost, true, true);
-    if (cached) {
+    // Incomplete caches would never heal: delta refreshes get 304 and do not re-query EntityDefinition
+    if (cached && isCompleteSobjectsList(cached.data ?? [])) {
       const sobjectsList = cached.data ?? [];
 
       //if we don't do the Preload SObjects before popup opens, we will refresh the cache in background
@@ -926,6 +927,11 @@ export async function getSobjectsList(sfHost) {
 
   // No cache - fetch and return
   return await fetchSobjectsList(sfHost, currentFetch, cacheEnabled, null, null);
+}
+
+function isCompleteSobjectsList(sobjectsList) {
+  return ["regularApi", "toolingApi"].every(api => sobjectsList.some(sobject => sobject.availableApis?.includes(api)))
+    && sobjectsList.some(sobject => sobject.durableId);
 }
 
 /**
@@ -1030,15 +1036,19 @@ async function fetchSobjectsList(sfHost, currentFetch, cacheEnabled, cachedSobje
             );
           }
         }
+        return true;
       } catch (err) {
         console.error("list " + api + " sobjects", err);
+        return false;
       }
     }
+
+    const entityDefinitionBatches = [];
 
     /**
      * Fetch EntityDefinition records from Salesforce Tooling API
      * Uses parallel batching to fetch all records (2000 per batch)
-     * @returns {Promise<void>} Resolves when all batches are fetched
+     * @returns {Promise<boolean>} Resolves once the count succeeded (true) or failed (false); batch promises are pushed to entityDefinitionBatches
      */
     function fetchEntityDefinitions() {
       const batchSize = 2000;
@@ -1049,7 +1059,7 @@ async function fetchSobjectsList(sfHost, currentFetch, cacheEnabled, cachedSobje
           const entityNb = res.totalSize;
           for (let bucket = 0; bucket < Math.ceil(entityNb / batchSize); bucket++) {
             const query = `SELECT QualifiedApiName, Label, KeyPrefix, DurableId, IsCustomSetting, RecordTypesSupported, NewUrl, IsEverCreatable FROM EntityDefinition ORDER BY QualifiedApiName LIMIT ${batchSize} OFFSET ${bucket * batchSize}`;
-            sfConn
+            entityDefinitionBatches.push(sfConn
               .rest(`/services/data/v${apiVersion}/tooling/query?q=${encodeURIComponent(query)}`)
               .then((respEntity) => {
                 for (let record of respEntity.records) {
@@ -1071,26 +1081,31 @@ async function fetchSobjectsList(sfHost, currentFetch, cacheEnabled, cachedSobje
                     null
                   );
                 }
+                return true;
               })
               .catch((err) => {
                 console.error("list entity definitions: ", err);
-              });
+                return false;
+              }));
           }
+          return true;
         })
         .catch((err) => {
           console.error("count entity definitions: ", err);
+          return false;
         });
     }
 
+    let fetchResults;
     if (entityMap.size > 0) {
       //it means that we already have fetched the data, so we just need to check if we have updates on regular and tooling api
-      await Promise.all([
+      fetchResults = await Promise.all([
         getObjects("/services/data/v" + apiVersion + "/sobjects/", "regularApi", lastFetch),
         getObjects("/services/data/v" + apiVersion + "/tooling/sobjects/", "toolingApi", lastFetch),
       ]);
     } else {
       // Fetch objects from different APIs
-      await Promise.all([
+      fetchResults = await Promise.all([
         getObjects("/services/data/v" + apiVersion + "/sobjects/", "regularApi", null),
         getObjects("/services/data/v" + apiVersion + "/tooling/sobjects/", "toolingApi", null),
         fetchEntityDefinitions(),
@@ -1099,13 +1114,23 @@ async function fetchSobjectsList(sfHost, currentFetch, cacheEnabled, cachedSobje
 
     const sobjectsList = Array.from(entityMap.values());
 
-    if (cacheEnabled && sobjectsList?.length > 0) {
-      await DataCache.setCachedData(Constants.CACHE_SOBJECTS_LIST, sfHost, sobjectsList, true, true, currentFetch, true);
-      //dispatch event when delta cache is set
-      window.dispatchEvent(new CustomEvent(Constants.SOBJECTS_LIST_REFRESHED_EVENT, {
-        detail: {sfHost, sobjectsList}
-      }));
-    }
+    // Entity definition batches keep enriching the entities after we return: cache only once they are merged,
+    // and never cache a partial result since later refreshes only send If-Modified-Since requests
+    Promise.all(entityDefinitionBatches)
+      .then(async (batchResults) => {
+        if (!cacheEnabled || entityMap.size == 0 || !fetchResults.concat(batchResults).every(Boolean)) {
+          return;
+        }
+        const completeSobjectsList = Array.from(entityMap.values());
+        await DataCache.setCachedData(Constants.CACHE_SOBJECTS_LIST, sfHost, completeSobjectsList, true, true, currentFetch, true);
+        //dispatch event when delta cache is set
+        window.dispatchEvent(new CustomEvent(Constants.SOBJECTS_LIST_REFRESHED_EVENT, {
+          detail: {sfHost, sobjectsList: completeSobjectsList}
+        }));
+      })
+      .catch((err) => {
+        console.error("sobjects list cache update error:", err);
+      });
 
     return sobjectsList;
   } catch (err) {
