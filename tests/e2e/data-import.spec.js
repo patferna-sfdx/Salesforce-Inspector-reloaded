@@ -237,6 +237,62 @@ test.describe("Data Import", () => {
     await expect(objectInput).toHaveValue("Inspector_Test__c");
   });
 
+  /**
+   * Loads the import page twice, the second time from the sobjects list cache, with the global
+   * describes answering 304 (no metadata change since the cached fetch) like Salesforce does
+   * @param {Object} options.failFirstRegularDescribe - Make the regular API global describe fail on the first load
+   */
+  async function reloadFromSobjectsCache(page, context, extensionId, {failFirstRegularDescribe}) {
+    let firstLoad = true;
+    await context.route(/\/services\/data\/v[\d.]+\/(tooling\/)?sobjects\/(\?.*)?$/, async route => {
+      if (firstLoad && failFirstRegularDescribe && !route.request().url().includes("/tooling/")) {
+        await route.fulfill({status: 500, contentType: "application/json", body: JSON.stringify([{errorCode: "UNKNOWN_EXCEPTION", message: "Transient error"}])});
+      } else if (route.request().headers()["if-modified-since"]) {
+        await route.fulfill({status: 304, body: ""});
+      } else {
+        await route.fallback();
+      }
+    });
+
+    await initImportPage(page, context, extensionId);
+    // Let the sobjects list fetch (and its cache update) complete before reloading
+    await page.waitForTimeout(500);
+    firstLoad = false;
+    await initImportPage(page, context, extensionId);
+  }
+
+  test("Object List Loaded From Cache", async ({page, context, extensionId}) => {
+    await reloadFromSobjectsCache(page, context, extensionId, {failFirstRegularDescribe: false});
+    await expect(page.locator("#sobjectlist option[value='Inspector_Test__c']")).toHaveCount(1);
+  });
+
+  test("Object List Recovers After a Failed Global Describe", async ({page, context, extensionId}) => {
+    await reloadFromSobjectsCache(page, context, extensionId, {failFirstRegularDescribe: true});
+    await expect(page.locator("#sobjectlist option[value='Inspector_Test__c']")).toHaveCount(1);
+  });
+
+  test("Object List Ignores an Incomplete Cache", async ({page, context, extensionId}) => {
+    await initImportPage(page, context, extensionId);
+    // Let this load's own cache update complete so it does not overwrite the seeded cache
+    await page.waitForTimeout(500);
+    // Cache written by previous versions when the regular API global describe failed
+    await page.evaluate(async (host) => {
+      const {DataCache} = await import("./utils.js");
+      const toolingOnlyList = [{name: "ApexClass", label: "Apex Class", keyPrefix: "01p", availableApis: ["toolingApi"], createable: true}];
+      await DataCache.setCachedData("sobjectsList", host, toolingOnlyList, true, true, Date.now(), true);
+    }, mockHost);
+    await context.route(/\/services\/data\/v[\d.]+\/(tooling\/)?sobjects\/(\?.*)?$/, async route => {
+      if (route.request().headers()["if-modified-since"]) {
+        await route.fulfill({status: 304, body: ""});
+      } else {
+        await route.fallback();
+      }
+    });
+
+    await initImportPage(page, context, extensionId);
+    await expect(page.locator("#sobjectlist option[value='Inspector_Test__c']")).toHaveCount(1);
+  });
+
   test("All Records Operations from CSV", async ({page, context, extensionId}) => {
     await initImportPage(page, context, extensionId);
     //create records and get the record ids
